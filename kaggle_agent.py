@@ -1,27 +1,33 @@
-import os
-import sys
 import io
-import re
 import json
-import pandas as pd
 import logging
-from contextlib import redirect_stdout, redirect_stderr
-from typing import TypedDict, List, Annotated, Dict
+import os
+import re
+import shutil
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from typing import Annotated, Dict, List, TypedDict
+
+import pandas as pd
+from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 from langsmith import traceable
-from langgraph.graph import StateGraph, END
-from langchain.chat_models import init_chat_model
-from dotenv import load_dotenv
-import shutil
 
 # Load environment variables from .env file
 load_dotenv(override=True)
 
-llm = init_chat_model(
-    "azure_openai:gpt-4.1-mini",
-    # "azure_openai:gpt-4o-mini",
+# Configure LangSmith
+os.environ["LANGSMITH_API_KEY"] = os.getenv("LANGSMITH_API_KEY", "")
+os.environ["LANGSMITH_PROJECT"] = os.getenv("LANGSMITH_PROJECT", "KaggleAgent")
+os.environ["LANGSMITH_TRACING"] = os.getenv("LANGSMITH_TRACING", "true")
+
+llm = ChatOpenAI(
+    model="moonshotai/kimi-k2:free",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
 
@@ -1199,7 +1205,7 @@ def setup_dataset(file_path: str, base_path: str):
 
 
 if __name__ == "__main__":
-    USE_TANICS_DATASET = False  # 設置為 True 以使用鐵達尼號資料集，否則使用自定義資料集
+    USE_TANICS_DATASET = True  # 設置為 True 以使用鐵達尼號資料集，否則使用自定義資料集
 
     if USE_TANICS_DATASET:
         data_directory = setup_titanic_dataset()
