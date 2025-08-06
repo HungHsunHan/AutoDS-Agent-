@@ -1,0 +1,11 @@
+kaggle_workspace_success/
+CSRC_workspace/
+SD_workspace/
+kaggle_agent.log
+.claude/
+__pycache__/
+.env
+final.csv
+*.ipynb
+CLAUDE.md
+kaggle_agent_workflow.png

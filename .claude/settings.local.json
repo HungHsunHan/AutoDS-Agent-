@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git branch:*)",
+      "Bash(git reset:*)",
+      "Bash(git commit:*)",
+      "Bash(git stash:*)",
+      "Bash(git rm:*)",
+      "Bash(rm:*)",
+      "Bash(del kaggle_agent.log)",
+      "Bash(python:*)"
+    ],
+    "deny": []
+  }
+}
