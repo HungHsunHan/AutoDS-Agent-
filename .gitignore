@@ -9,3 +9,5 @@ final.csv
 *.ipynb
 CLAUDE.md
 kaggle_agent_workflow.png
+kaggle_workspace/
+.claude/

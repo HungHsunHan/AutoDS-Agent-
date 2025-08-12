@@ -16,6 +16,35 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langsmith import traceable
 
+# Import prompt definitions
+from prompts import (
+    DATA_ANALYST_PROMPT,
+    FEATURE_ENGINEER_PROMPT,
+    MODEL_ARCHITECT_PROMPT,
+    PROJECT_MANAGER_PROMPT,
+    REPORT_GENERATOR_PROMPT,
+    STRATEGIST_PROMPT,
+)
+
+
+# Utility to safely escape curly braces in prompts when used with ChatPromptTemplate
+# to prevent accidental variable detection (e.g., JSON examples). Keeps specified placeholders.
+def _escape_braces_for_template(text: str, keep: List[str] | None = None) -> str:
+    if not text:
+        return text
+    keep = keep or []
+    placeholders = {k: f"__PLACEHOLDER_{i}__" for i, k in enumerate(keep)}
+    # Temporarily replace kept placeholders
+    for k, ph in placeholders.items():
+        text = text.replace(f"{{{k}}}", ph)
+    # Escape all remaining braces
+    text = text.replace("{", "{{").replace("}", "}}")
+    # Restore kept placeholders
+    for k, ph in placeholders.items():
+        text = text.replace(ph, f"{{{k}}}")
+    return text
+
+
 # Load environment variables from .env file
 load_dotenv(override=True)
 
@@ -24,38 +53,346 @@ os.environ["LANGSMITH_API_KEY"] = os.getenv("LANGSMITH_API_KEY", "")
 os.environ["LANGSMITH_PROJECT"] = os.getenv("LANGSMITH_PROJECT", "KaggleAgent")
 os.environ["LANGSMITH_TRACING"] = os.getenv("LANGSMITH_TRACING", "true")
 
+# Standard LLM instance
+# z-ai/glm-4.5-air:free, moonshotai/kimi-k2:free, deepseek/deepseek-chat-v3-0324:free, qwen/qwen3-coder
+# google/gemini-2.0-flash-001
+model = "openai/gpt-4.1-mini"
 llm = ChatOpenAI(
-    model="moonshotai/kimi-k2:free",
+    model=model,
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
+    temperature=0.1,  # Lower temperature for more consistent output
+    model_kwargs={
+        "response_format": {"type": "json_object"}  # Enable JSON mode when supported
+    },
 )
+
+# JSON-optimized LLM instance for structured outputs
+json_llm_base = ChatOpenAI(
+    model=model,
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    temperature=0,  # Very low temperature for structured output
+    # max_tokens=40000,  # Reduced from 4000 to prevent truncation errors
+    model_kwargs={"response_format": {"type": "json_object"}},
+)
+
+
+# Helper function to create structured LLM with schema
+def create_structured_llm(schema: dict):
+    """Create a structured output LLM with the given schema and JSON validation"""
+    return json_llm_base.with_structured_output(schema)
+
+
+# Validation helper function
+def validate_json_response(response, schema_title: str) -> bool:
+    """Validate if the response matches expected structure"""
+    try:
+        # Handle string responses that might be JSON
+        if isinstance(response, str):
+            logger.warning(
+                f"⚠️  Received string response for {schema_title}: {response[:100]}..."
+            )
+            try:
+                import json
+                import re
+
+                # Clean the response before parsing
+                cleaned_response = response.strip()
+                # Fix common JSON formatting issues with newlines in field names/values
+                cleaned_response = re.sub(r'\n\s+(".*?":)', r" \1", cleaned_response)
+                # Remove standalone newlines in JSON values
+                cleaned_response = re.sub(
+                    r'"\s*\n\s*([^"]*)\s*\n\s*"', r'"\1"', cleaned_response
+                )
+
+                parsed = json.loads(cleaned_response)
+                if isinstance(parsed, dict):
+                    logger.debug(
+                        f"✅ Successfully parsed string JSON response for {schema_title}"
+                    )
+                    return True
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"⚠️  String response is not valid JSON for {schema_title}: {e}"
+                )
+                logger.debug(f"Original response: {response[:200]}...")
+                return False
+
+        if hasattr(response, "__dict__") or isinstance(response, dict):
+            logger.debug(f"✅ Valid JSON response for {schema_title}")
+            return True
+        else:
+            logger.warning(
+                f"⚠️  Invalid JSON response structure for {schema_title}, type: {type(response)}"
+            )
+            return False
+    except Exception as e:
+        logger.error(f"❌ JSON validation error for {schema_title}: {e}")
+        return False
+
+
+# JSON mode effectiveness monitoring
+def log_json_mode_stats(stats: dict = None):
+    """Log statistics about JSON mode effectiveness"""
+    if stats is None:
+        stats = {
+            "total_requests": 0,
+            "json_success": 0,
+            "fallback_used": 0,
+            "validation_failures": 0,
+        }
+
+    success_rate = (
+        (stats["json_success"] / stats["total_requests"] * 100)
+        if stats["total_requests"] > 0
+        else 0
+    )
+
+    logger.debug("=" * 50)
+    logger.debug("📊 JSON模式效能統計")
+    logger.debug(f"總請求數: {stats['total_requests']}")
+    logger.debug(f"JSON成功: {stats['json_success']} ({success_rate:.1f}%)")
+    logger.debug(f"後備模式: {stats['fallback_used']}")
+    logger.debug(f"驗證失敗: {stats['validation_failures']}")
+    logger.debug("=" * 50)
+
+    if success_rate < 80:
+        logger.warning("⚠️  JSON模式成功率低於80%，建議檢查LLM配置")
+    elif success_rate > 95:
+        logger.debug("🎉 JSON模式運作優異！")
+
+    return stats
+
+
+# Response sanitization and validation for routing
+def validate_and_sanitize_strategist_response(
+    response, fallback_agent="Feature_Engineer_Agent"
+):
+    """
+    Validate and sanitize strategist response to ensure valid routing.
+
+    Args:
+        response: The strategist response object
+        fallback_agent: Default agent to route to if validation fails
+
+    Returns:
+        dict: Sanitized response with guaranteed valid next_step
+    """
+    allowed_next_steps = {
+        "Data_Analysis_Agent",
+        "Feature_Engineer_Agent",
+        "Model_Architect_Agent",
+        "Report_Generator_Agent",
+        "END",
+    }
+
+    # Handle different response types
+    sanitized_response = {}
+
+    try:
+        # Extract response data
+        if hasattr(response, "model_dump") and callable(
+            getattr(response, "model_dump")
+        ):
+            sanitized_response = response.model_dump()
+        elif hasattr(response, "dict") and callable(getattr(response, "dict")):
+            sanitized_response = response.dict()
+        elif isinstance(response, dict):
+            sanitized_response = response.copy()
+        else:
+            logger.warning(f"⚠️  Unexpected response type: {type(response)}")
+            sanitized_response = {
+                "next_step": fallback_agent,
+                "feedback": str(response),
+            }
+
+        # Validate and sanitize next_step
+        next_step = sanitized_response.get("next_step", "").strip()
+
+        # Handle common malformed values
+        if not next_step or next_step in ["", " ", ":", ": ", "None", "null"]:
+            logger.warning(
+                f"⚠️  Empty or malformed next_step '{next_step}', using fallback: {fallback_agent}"
+            )
+            next_step = fallback_agent
+        elif next_step not in allowed_next_steps:
+            logger.warning(
+                f"⚠️  Invalid next_step '{next_step}', using fallback: {fallback_agent}"
+            )
+            next_step = fallback_agent
+
+        # Ensure required fields exist
+        sanitized_response["next_step"] = next_step
+        if "feedback" not in sanitized_response or not sanitized_response["feedback"]:
+            sanitized_response["feedback"] = (
+                f"Proceeding to {next_step} based on current workflow state."
+            )
+
+        # Sanitize other fields
+        for field in ["validation_score", "test_score"]:
+            if field in sanitized_response and sanitized_response[field] is not None:
+                try:
+                    sanitized_response[field] = float(sanitized_response[field])
+                except (ValueError, TypeError):
+                    sanitized_response[field] = None
+
+        logger.debug(f"✅ Strategist response validated: next_step='{next_step}'")
+        return sanitized_response
+
+    except Exception as e:
+        logger.error(f"❌ Response validation failed: {e}")
+        return {
+            "next_step": fallback_agent,
+            "feedback": f"Validation error occurred, proceeding to {fallback_agent}. Error: {str(e)}",
+            "validation_score": None,
+            "test_score": None,
+            "submission_file_path": "",
+            "performance_analysis": "",
+            "should_continue": True,
+            "error_analysis": f"Response validation error: {str(e)}",
+            "confidence_level": 0.5,
+        }
+
+
+# Debug and monitoring utilities
+def debug_workflow_state(state: dict, checkpoint_name: str = "unknown"):
+    """
+    Debug utility to log workflow state at key checkpoints.
+    """
+    logger.debug(f"=== 工作流程狀態檢查點: {checkpoint_name} ===")
+
+    # Log key state information
+    key_fields = [
+        "target_column",
+        "validation_score",
+        "test_score",
+        "submission_file_path",
+        "last_code_generating_agent",
+        "error_count",
+        "next_node_after_triage",
+    ]
+
+    for field in key_fields:
+        value = state.get(field)
+        if value is not None:
+            logger.debug(f"  {field}: {value}")
+
+    # Check strategist decision
+    strategist_decision = state.get("strategist_decision")
+    if strategist_decision:
+        next_step = strategist_decision.get("next_step")
+        logger.debug(f"  strategist_next_step: {next_step}")
+
+    # Check available files
+    available_files = state.get("available_files", {})
+    if available_files:
+        total_files = sum(len(files) for files in available_files.values())
+        logger.debug(f"  total_available_files: {total_files}")
+        for folder, files in available_files.items():
+            if files:
+                logger.debug(f"    {folder}: {len(files)} files")
+
+    logger.debug("=" * 50)
+
+
+def validate_llm_response_structure(response, expected_schema: str, agent_name: str):
+    """
+    Enhanced validation for LLM responses with detailed debugging.
+    """
+    logger.debug(f"🔍 Validating {agent_name} response structure for {expected_schema}")
+
+    # Check response type
+    logger.debug(f"  Response type: {type(response)}")
+
+    # Try to extract content
+    if hasattr(response, "content"):
+        logger.debug(f"  Response has content: {len(str(response.content))} chars")
+        if isinstance(response.content, str):
+            # Check if it looks like JSON
+            content = response.content.strip()
+            if content.startswith("{") and content.endswith("}"):
+                logger.debug("  Content appears to be JSON format")
+            else:
+                logger.warning("  Content does not appear to be JSON format")
+
+    # Check for structured output attributes
+    if hasattr(response, "model_dump"):
+        logger.debug("  Response has model_dump method (Pydantic v2)")
+    elif hasattr(response, "dict"):
+        logger.debug("  Response has dict method (Pydantic v1)")
+    elif isinstance(response, dict):
+        logger.debug("  Response is already a dict")
+    else:
+        logger.warning(f"  Unknown response structure: {dir(response)}")
+
+    return True
+
+
+# Enhanced error tracking
+def track_agent_error(agent_name: str, error_type: str, error_details: str):
+    """
+    Enhanced error tracking with better categorization.
+    """
+    increment_error_stats(error_type, agent_name)
+
+    # Log structured error information
+    logger.error(f"🚨 {agent_name} Error Detected:")
+    logger.error(f"   Type: {error_type}")
+    logger.error(f"   Details: {error_details[:200]}...")
+
+    # Add to global error tracking
+    current_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    error_entry = {
+        "timestamp": current_time,
+        "agent": agent_name,
+        "type": error_type,
+        "details": error_details[:500],  # Truncate long errors
+    }
+
+    # Store in global error log (if needed for analysis)
+    if not hasattr(track_agent_error, "error_log"):
+        track_agent_error.error_log = []
+    track_agent_error.error_log.append(error_entry)
+
+    # Keep only last 50 errors to prevent memory bloat
+    if len(track_agent_error.error_log) > 50:
+        track_agent_error.error_log = track_agent_error.error_log[-50:]
 
 
 # 配置日志系统
 def setup_logging():
-    """設置日志記錄系統"""
+    """設置增強的日志記錄系統 - 專注於錯誤檢測"""
     # 创建日志记录器
     logger = logging.getLogger("kaggle_agent")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)  # 設置為DEBUG以捕獲所有級別
 
     # 如果logger已经有handlers，先清除
     if logger.handlers:
-        logger.handlers.clear()  # 创建文件处理器
-    file_handler = logging.FileHandler("kaggle_agent.log", mode="a", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
+        logger.handlers.clear()
 
-    # 创建控制台处理器
+    # 創建文件處理器 - 保存詳細日志用於調試
+    file_handler = logging.FileHandler(
+        "kaggle_agent.log", mode="w", encoding="utf-8"
+    )  # 使用'w'模式重新開始
+    file_handler.setLevel(logging.DEBUG)
+
+    # 創建控制台處理器 - 只顯示警告和錯誤
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)  # 只顯示WARNING及以上級別
 
-    # 创建格式化器
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    # 創建不同的格式化器
+    # 文件使用詳細格式
+    file_formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
+    # 控制台使用簡潔格式，重點突出錯誤
+    console_formatter = logging.Formatter("%(levelname)s: %(message)s")
+
+    file_handler.setFormatter(file_formatter)
+    console_handler.setFormatter(console_formatter)
 
     # 添加处理器到logger
     logger.addHandler(file_handler)
@@ -66,6 +403,230 @@ def setup_logging():
 
 # 初始化日志系统
 logger = setup_logging()
+
+# 錯誤統計追蹤
+error_stats = {
+    "total_errors": 0,
+    "syntax_errors": 0,
+    "import_errors": 0,
+    "runtime_errors": 0,
+    "file_errors": 0,
+    "last_agent_errors": {},
+}
+
+
+def log_error_stats():
+    """記錄錯誤統計摘要"""
+    if error_stats["total_errors"] > 0:
+        logger.warning(f"🚨 錯誤統計總結:")
+        logger.warning(f"   總錯誤數: {error_stats['total_errors']}")
+        logger.warning(f"   語法錯誤: {error_stats['syntax_errors']}")
+        logger.warning(f"   導入錯誤: {error_stats['import_errors']}")
+        logger.warning(f"   運行時錯誤: {error_stats['runtime_errors']}")
+        logger.warning(f"   文件錯誤: {error_stats['file_errors']}")
+        if error_stats["last_agent_errors"]:
+            logger.warning(f"   各代理錯誤次數: {error_stats['last_agent_errors']}")
+
+
+def increment_error_stats(error_type: str, agent_name: str):
+    """增加錯誤統計計數"""
+    error_stats["total_errors"] += 1
+
+    # 按錯誤類型分類
+    if "syntax" in error_type:
+        error_stats["syntax_errors"] += 1
+    elif "import" in error_type:
+        error_stats["import_errors"] += 1
+    elif "file" in error_type:
+        error_stats["file_errors"] += 1
+    else:
+        error_stats["runtime_errors"] += 1
+
+    # 按代理分類
+    if agent_name not in error_stats["last_agent_errors"]:
+        error_stats["last_agent_errors"][agent_name] = 0
+    error_stats["last_agent_errors"][agent_name] += 1
+
+
+# --- JSON Schema Definitions for Structured Output ---
+
+# Project Manager Schema
+PROJECT_MANAGER_SCHEMA = {
+    "title": "ProjectManagerResponse",
+    "type": "object",
+    "properties": {
+        "target_column": {
+            "title": "Target Column",
+            "type": "string",
+            "description": "推斷的目標欄位名稱",
+        },
+        "plan": {
+            "title": "Project Plan",
+            "type": "string",
+            "description": "詳細的專案計畫",
+        },
+        "problem_type": {
+            "title": "Problem Type",
+            "type": "string",
+            "description": "問題類型（分類、回歸等）",
+        },
+        "evaluation_metric": {
+            "title": "Evaluation Metric",
+            "type": "string",
+            "description": "評估指標（AUC、Accuracy等）",
+        },
+        "next_task_description": {
+            "title": "Next Task Description",
+            "type": "string",
+            "description": "給下一個代理的任務描述",
+        },
+    },
+    "required": ["target_column", "plan", "next_task_description"],
+}
+
+# Code-Generating Agent Schema
+CODE_AGENT_SCHEMA = {
+    "title": "CodeAgentResponse",
+    "type": "object",
+    "properties": {
+        "code_to_execute": {
+            "title": "Code to Execute",
+            "type": "string",
+            "description": "要執行的Python程式碼",
+        },
+        "description": {
+            "title": "Code Description",
+            "type": "string",
+            "description": "程式碼功能描述",
+        },
+        "expected_outputs": {
+            "title": "Expected Outputs",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "預期的輸出檔案或結果",
+        },
+        "dependencies": {
+            "title": "Dependencies",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "所需的Python套件",
+        },
+        "data_sources": {
+            "title": "Data Sources",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "使用的資料來源檔案",
+        },
+        "output_files": {
+            "title": "Output Files",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "將要生成的檔案路徑",
+        },
+    },
+    "required": ["code_to_execute", "description"],
+}
+
+# Enhanced Strategist Schema (extending the existing one)
+ENHANCED_STRATEGIST_SCHEMA = {
+    "title": "StrategistDecision",
+    "type": "object",
+    "properties": {
+        "next_step": {
+            "title": "Next Step",
+            "type": "string",
+            "enum": [
+                "Data_Analysis_Agent",
+                "Feature_Engineer_Agent",
+                "Model_Architect_Agent",
+                "Report_Generator_Agent",
+                "END",
+            ],
+            "description": "下一個要呼叫的代理或END結束流程",
+        },
+        "feedback": {"title": "Feedback", "type": "string"},
+        "validation_score": {
+            "title": "Validation Score",
+            "type": ["number", "null"],
+            "description": "驗證分數，從執行輸出中解析出來，如果沒有找到則為null",
+        },
+        "test_score": {
+            "title": "Test Score",
+            "type": ["number", "null"],
+            "description": "測試分數，從執行輸出中解析出來，如果沒有找到則為null",
+        },
+        "submission_file_path": {
+            "title": "Submission File Path",
+            "type": "string",
+            "description": "提交檔案路徑，從執行輸出中解析出來，如果沒有找到則為空字串",
+        },
+        "performance_analysis": {
+            "title": "Performance Analysis",
+            "type": "string",
+            "description": "對模型性能的分析，包括驗證分數和測試分數的評估、是否過擬合、是否需要優化等",
+        },
+        "should_continue": {
+            "title": "Should Continue",
+            "type": "boolean",
+            "description": "基於性能分析，判斷是否應該繼續優化模型還是結束流程",
+        },
+        "error_analysis": {
+            "title": "Error Analysis",
+            "type": "string",
+            "description": "對錯誤的分析和建議的解決方案",
+        },
+        "confidence_level": {
+            "title": "Confidence Level",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "對決策的信心程度（0-1）",
+        },
+    },
+    "required": ["next_step", "feedback"],
+}
+
+# Report Generator Schema
+REPORT_GENERATOR_SCHEMA = {
+    "title": "ReportGeneratorResponse",
+    "type": "object",
+    "properties": {
+        "code_to_execute": {
+            "title": "Code to Execute",
+            "type": "string",
+            "description": "要執行的Python程式碼來生成報告",
+        },
+        "report_title": {
+            "title": "Report Title",
+            "type": "string",
+            "description": "報告標題",
+        },
+        "report_summary": {
+            "title": "Report Summary",
+            "type": "string",
+            "description": "報告摘要",
+        },
+        "key_findings": {
+            "title": "Key Findings",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "主要發現列表",
+        },
+        "recommendations": {
+            "title": "Recommendations",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "建議列表",
+        },
+        "charts_analyzed": {
+            "title": "Charts Analyzed",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "分析的圖表列表",
+        },
+    },
+    "required": ["code_to_execute", "report_title", "report_summary"],
+}
 
 
 class KaggleWorkflowState(TypedDict):
@@ -115,20 +676,120 @@ class KaggleWorkflowState(TypedDict):
 
 
 def _clean_code(code: str) -> str:
-    """一個輔助函式，用於清理程式碼字串，移除 Markdown 標籤。"""
-    # 移除 ```python, ```, etc.
+    """
+    輔助函式，用於清理程式碼字串。
+    在JSON模式下主要用於後備處理，移除 Markdown 標籤。
+    """
+    # 移除 ```python, ```, etc. (後備清理，JSON模式下應該不需要)
     if "```python" in code:
-        code = re.search(r"```python\n(.*)```", code, re.DOTALL).group(1)
+        try:
+            code = re.search(r"```python\n(.*)```", code, re.DOTALL).group(1)
+        except AttributeError:
+            # 如果正則表達式失敗，嘗試簡單替換
+            code = code.replace("```python", "").replace("```", "")
     elif "```" in code:
         code = code.replace("```", "")
     return code.strip()
+
+
+def _categorize_execution_errors(stderr: str, agent_name: str = None) -> Dict:
+    """
+    分類和分析代碼執行錯誤
+    """
+    if not stderr:
+        return {
+            "has_error": False,
+            "error_type": "none",
+            "error_details": "",
+            "formatted_error": "",
+        }
+
+    stderr_lower = stderr.lower()
+
+    # 錯誤類型檢測
+    error_patterns = {
+        "syntax_error": ["syntaxerror", "invalid syntax", "unexpected token"],
+        "import_error": ["importerror", "modulenotfounderror", "no module named"],
+        "file_error": ["filenotfounderror", "no such file", "permission denied"],
+        "memory_error": ["memoryerror", "out of memory"],
+        "key_error": ["keyerror", "key not found"],
+        "attribute_error": ["attributeerror", "has no attribute"],
+        "type_error": ["typeerror", "unsupported operand", "argument"],
+        "value_error": ["valueerror", "invalid literal", "cannot convert"],
+        "index_error": ["indexerror", "list index out of range"],
+        "zero_division": ["zerodivisionerror", "division by zero"],
+        "runtime_error": ["runtimeerror", "runtime error"],
+        "assertion_error": ["assertionerror"],
+        "pandas_error": ["keyerror", "dataframeerror", "series"],
+        "sklearn_error": ["sklearn", "fit", "transform", "predict"],
+    }
+
+    # 警告模式檢測
+    warning_patterns = [
+        "warning",
+        "deprecat",
+        "future",
+        "userwarning",
+        "deprecationwarning",
+        "futurewarning",
+        "pendingdeprecationwarning",
+    ]
+
+    # 首先檢查是否只是警告
+    is_only_warning = True
+    error_keywords = ["error", "exception", "traceback", "failed"]
+
+    for keyword in error_keywords:
+        if keyword in stderr_lower:
+            # 檢查是否在警告上下文中
+            if not any(warn in stderr_lower for warn in warning_patterns):
+                is_only_warning = False
+                break
+
+    if is_only_warning:
+        return {
+            "has_error": False,
+            "error_type": "warning",
+            "error_details": stderr.strip(),
+            "formatted_error": "",
+        }
+
+    # 確定錯誤類型
+    detected_error_type = "unknown_error"
+    for error_type, patterns in error_patterns.items():
+        if any(pattern in stderr_lower for pattern in patterns):
+            detected_error_type = error_type
+            break
+
+    # 提取關鍵錯誤信息
+    error_lines = stderr.split("\n")
+    key_error_lines = []
+    for line in error_lines:
+        line_lower = line.lower().strip()
+        if any(
+            keyword in line_lower for keyword in ["error:", "exception:", "traceback"]
+        ):
+            key_error_lines.append(line.strip())
+        elif line.strip() and not any(warn in line_lower for warn in warning_patterns):
+            # 包含非空的非警告行
+            if len(key_error_lines) < 3:  # 限制關鍵行數
+                key_error_lines.append(line.strip())
+
+    error_summary = "\n".join(key_error_lines) if key_error_lines else stderr.strip()
+
+    return {
+        "has_error": True,
+        "error_type": detected_error_type,
+        "error_details": error_summary,
+        "formatted_error": stderr.strip(),
+    }
 
 
 def setup_workspace_structure(base_path: str = "./kaggle_workspace") -> Dict:
     """
     設置工作區的資料夾結構並返回路徑資訊。
     """
-    logger.info("正在設置工作區結構")
+    logger.debug("正在設置工作區結構")
 
     # 創建基礎工作目錄
     os.makedirs(base_path, exist_ok=True)
@@ -147,14 +808,14 @@ def setup_workspace_structure(base_path: str = "./kaggle_workspace") -> Dict:
     # 創建所有資料夾
     for folder_name, folder_path in folders.items():
         os.makedirs(folder_path, exist_ok=True)
-        logger.info(f"已創建/確認資料夾: {folder_name} -> {folder_path}")
+        logger.debug(f"已創建/確認資料夾: {folder_name} -> {folder_path}")
 
     return folders
 
 
 def scan_available_files(workspace_paths: Dict) -> Dict:
     """
-    掃描工作區中現有的檔案。
+    Enhanced file scanning with intelligent file detection and categorization.
     """
     available_files = {
         "data": [],
@@ -162,6 +823,14 @@ def scan_available_files(workspace_paths: Dict) -> Dict:
         "model": [],
         "after_preprocessing": [],
         "workspace": [],
+    }
+
+    file_categories = {
+        "csv_files": [],
+        "image_files": [],
+        "model_files": [],
+        "processed_files": [],
+        "analysis_files": [],
     }
 
     for folder_name, folder_path in workspace_paths.items():
@@ -173,10 +842,309 @@ def scan_available_files(workspace_paths: Dict) -> Dict:
                     if os.path.isfile(os.path.join(folder_path, f))
                 ]
                 available_files[folder_name] = files
+
+                # Categorize files by type and purpose
+                for file in files:
+                    file_lower = file.lower()
+                    file_path = os.path.join(folder_path, file)
+
+                    if file_lower.endswith((".csv")):
+                        file_categories["csv_files"].append(
+                            {
+                                "name": file,
+                                "path": file_path,
+                                "folder": folder_name,
+                                "size": (
+                                    os.path.getsize(file_path)
+                                    if os.path.exists(file_path)
+                                    else 0
+                                ),
+                            }
+                        )
+
+                        if "processed" in file_lower:
+                            file_categories["processed_files"].append(
+                                {"name": file, "path": file_path, "folder": folder_name}
+                            )
+
+                    elif file_lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg")):
+                        file_categories["image_files"].append(
+                            {"name": file, "path": file_path, "folder": folder_name}
+                        )
+
+                    elif file_lower.endswith(
+                        (".pkl", ".joblib", ".model", ".h5", ".pt")
+                    ):
+                        file_categories["model_files"].append(
+                            {"name": file, "path": file_path, "folder": folder_name}
+                        )
+
+                    elif file_lower.endswith((".json", ".txt", ".md")):
+                        file_categories["analysis_files"].append(
+                            {"name": file, "path": file_path, "folder": folder_name}
+                        )
+
             except PermissionError:
                 available_files[folder_name] = []
 
+    # Add file categories to the return dict
+    available_files["file_categories"] = file_categories
     return available_files
+
+
+def generate_file_context_string(workspace_paths: Dict, available_files: Dict) -> str:
+    """
+    Generate a comprehensive file context string for agents.
+    """
+    context_parts = []
+
+    # Add workspace structure
+    context_parts.append("=== CURRENT WORKSPACE STRUCTURE ===")
+    for folder_name, folder_path in workspace_paths.items():
+        files = available_files.get(folder_name, [])
+        context_parts.append(f"{folder_name.upper()} FOLDER: {folder_path}")
+        if files:
+            for file in files[:10]:  # Limit to first 10 files per folder
+                context_parts.append(f"  - {file}")
+            if len(files) > 10:
+                context_parts.append(f"  ... and {len(files) - 10} more files")
+        else:
+            context_parts.append("  - (empty)")
+
+    # Add categorized file information
+    file_cats = available_files.get("file_categories", {})
+    context_parts.append("\n=== AVAILABLE DATA FILES ===")
+
+    csv_files = file_cats.get("csv_files", [])
+    if csv_files:
+        context_parts.append("CSV Files:")
+        for file_info in csv_files:
+            size_mb = file_info["size"] / (1024 * 1024) if file_info["size"] > 0 else 0
+            context_parts.append(
+                f"  - {file_info['name']} ({file_info['folder']} folder, {size_mb:.1f}MB)"
+            )
+
+    processed_files = file_cats.get("processed_files", [])
+    if processed_files:
+        context_parts.append("Processed Data Files:")
+        for file_info in processed_files:
+            context_parts.append(
+                f"  - {file_info['name']} ({file_info['folder']} folder)"
+            )
+
+    context_parts.append("\n=== AVAILABLE VISUALIZATION FILES ===")
+    image_files = file_cats.get("image_files", [])
+    if image_files:
+        for file_info in image_files[:15]:  # Limit to first 15 images
+            context_parts.append(
+                f"  - {file_info['name']} ({file_info['folder']} folder)"
+            )
+        if len(image_files) > 15:
+            context_parts.append(f"  ... and {len(image_files) - 15} more images")
+
+    context_parts.append("\n=== PATH USAGE GUIDELINES ===")
+    context_parts.append("- Always use relative paths from the workspace root")
+    context_parts.append("- Data files: Use 'data/filename.csv'")
+    context_parts.append(
+        "- Processed data: Use 'after_preprocessing/filename.csv' or 'processed/filename.csv'"
+    )
+    context_parts.append("- Save images to: 'image/filename.png'")
+    context_parts.append("- Save models to: 'model/filename.pkl'")
+    context_parts.append("- For analysis outputs: Check existing files first")
+
+    return "\n".join(context_parts)
+
+
+def validate_and_suggest_file_paths(
+    code: str, workspace_paths: Dict, available_files: Dict
+) -> Dict:
+    """
+    Validate file paths in code and suggest corrections.
+    """
+    suggestions = []
+    corrections = []
+
+    import re
+
+    # Common file path patterns in Python code
+    path_patterns = [
+        r'pd\.read_csv\([\'"]([^\'"]+)[\'"]',  # pandas read_csv
+        r'\.to_csv\([\'"]([^\'"]+)[\'"]',  # pandas to_csv
+        r'plt\.savefig\([\'"]([^\'"]+)[\'"]',  # matplotlib savefig
+        r'open\([\'"]([^\'"]+)[\'"]',  # file open
+        r'[\'"]([^\'"]*.csv)[\'"]',  # any .csv reference
+        r'[\'"]([^\'"]*.png)[\'"]',  # any .png reference
+        r'[\'"]([^\'"]*.pkl)[\'"]',  # any .pkl reference
+    ]
+
+    found_paths = set()
+    for pattern in path_patterns:
+        matches = re.findall(pattern, code)
+        found_paths.update(matches)
+
+    # Check each found path
+    file_cats = available_files.get("file_categories", {})
+    all_available_files = {}
+
+    # Build a lookup of available files
+    for cat_name, files in file_cats.items():
+        for file_info in files:
+            filename = file_info["name"]
+            folder = file_info["folder"]
+            all_available_files[filename] = {
+                "folder": folder,
+                "correct_path": f"{folder}/{filename}",
+                "full_path": file_info["path"],
+            }
+
+    for path in found_paths:
+        path_clean = path.strip()
+        if not path_clean:
+            continue
+
+        # Check if path exists as specified
+        full_path = None
+        if os.path.isabs(path_clean):
+            full_path = path_clean
+        else:
+            # Try relative to workspace
+            workspace_root = workspace_paths.get("workspace", "")
+            full_path = os.path.join(workspace_root, path_clean)
+
+        if full_path and os.path.exists(full_path):
+            # Path is valid
+            continue
+
+        # Path doesn't exist, try to suggest correction
+        filename = os.path.basename(path_clean)
+
+        if filename in all_available_files:
+            file_info = all_available_files[filename]
+            suggested_path = file_info["correct_path"]
+
+            suggestions.append(
+                {
+                    "original_path": path_clean,
+                    "suggested_path": suggested_path,
+                    "reason": f"File exists in {file_info['folder']} folder",
+                    "correction": path_clean != suggested_path,
+                }
+            )
+
+            if path_clean != suggested_path:
+                corrections.append({"from": path_clean, "to": suggested_path})
+        else:
+            # Try fuzzy matching
+            similar_files = []
+            for available_file in all_available_files.keys():
+                if (
+                    filename.lower() in available_file.lower()
+                    or available_file.lower() in filename.lower()
+                ):
+                    similar_files.append(available_file)
+
+            if similar_files:
+                best_match = similar_files[0]
+                file_info = all_available_files[best_match]
+                suggestions.append(
+                    {
+                        "original_path": path_clean,
+                        "suggested_path": file_info["correct_path"],
+                        "reason": f"Similar file '{best_match}' found in {file_info['folder']} folder",
+                        "correction": True,
+                    }
+                )
+
+    return {
+        "suggestions": suggestions,
+        "corrections": corrections,
+        "validation_passed": len(corrections) == 0,
+    }
+
+
+def apply_path_corrections(code: str, corrections: List[Dict]) -> str:
+    """
+    Apply path corrections to code.
+    """
+    corrected_code = code
+    for correction in corrections:
+        # Use word boundaries to avoid partial matches
+        pattern = re.escape(correction["from"])
+        replacement = correction["to"]
+        corrected_code = re.sub(
+            rf"['\"]\\s*{pattern}\\s*['\"]", f'"{replacement}"', corrected_code
+        )
+
+    return corrected_code
+
+
+def detect_file_changes(old_files: Dict, new_files: Dict) -> Dict:
+    """
+    Detect changes in file system between two file states.
+    """
+    changes = {
+        "new_files": [],
+        "deleted_files": [],
+        "modified_files": [],
+        "summary": "",
+    }
+
+    # Check each folder for changes
+    all_folders = set(old_files.keys()).union(set(new_files.keys()))
+
+    for folder in all_folders:
+        if folder == "file_categories":  # Skip the categories metadata
+            continue
+
+        old_folder_files = set(old_files.get(folder, []))
+        new_folder_files = set(new_files.get(folder, []))
+
+        # New files
+        new_in_folder = new_folder_files - old_folder_files
+        for file in new_in_folder:
+            changes["new_files"].append(f"{folder}/{file}")
+
+        # Deleted files
+        deleted_in_folder = old_folder_files - new_folder_files
+        for file in deleted_in_folder:
+            changes["deleted_files"].append(f"{folder}/{file}")
+
+    # Generate summary
+    total_changes = (
+        len(changes["new_files"])
+        + len(changes["deleted_files"])
+        + len(changes["modified_files"])
+    )
+    if total_changes > 0:
+        changes["summary"] = (
+            f"{len(changes['new_files'])} new, {len(changes['deleted_files'])} deleted, {len(changes['modified_files'])} modified"
+        )
+    else:
+        changes["summary"] = "no changes"
+
+    return changes
+
+
+def create_file_state_backup(state: Dict) -> Dict:
+    """
+    Create a backup of current file state for rollback purposes.
+    """
+    backup = {
+        "available_files": state.get("available_files", {}),
+        "workspace_paths": state.get("workspace_paths", {}),
+        "timestamp": pd.Timestamp.now().isoformat(),
+    }
+    return backup
+
+
+def restore_file_state_from_backup(backup: Dict) -> Dict:
+    """
+    Restore file state from backup (for rollback scenarios).
+    """
+    return {
+        "available_files": backup.get("available_files", {}),
+        "workspace_paths": backup.get("workspace_paths", {}),
+    }
 
 
 @traceable(name="execute_code_node")
@@ -185,21 +1153,57 @@ def execute_code(state: KaggleWorkflowState) -> Dict:
     在一個受控環境中執行程式碼的工具節點。
     支援傳統執行和 Docker 安全執行兩種模式。
     """
-    logger.info("正在執行程式碼")
+    logger.debug("正在執行程式碼")
 
     code = state.get("code_to_execute", "")
     if not code:
         return {"execution_stdout": "", "execution_stderr": "沒有提供程式碼。"}
 
-    # **V2 更新**: 在執行前清理程式碼
+    # 智能程式碼清理：JSON模式下通常不需要，但保留作為後備
     cleaned_code = _clean_code(code)
+
+    # 記錄是否需要清理（監控JSON模式效果）
+    if cleaned_code != code:
+        logger.warning(f"⚠️  程式碼需要清理，可能JSON模式未正常工作")
+    else:
+        logger.debug("✅ 程式碼已為純淨格式，JSON模式運作正常")
+
+    # Enhanced path validation and correction
+    workspace_paths = state.get("workspace_paths", {})
+    available_files = state.get("available_files", {})
+
+    if workspace_paths and available_files:
+        validation_result = validate_and_suggest_file_paths(
+            cleaned_code, workspace_paths, available_files
+        )
+
+        if not validation_result["validation_passed"]:
+            logger.warning(
+                f"⚠️  發現 {len(validation_result['corrections'])} 個路徑問題，正在自動修正"
+            )
+            for suggestion in validation_result["suggestions"]:
+                if suggestion["correction"]:
+                    logger.debug(
+                        f"路徑修正: {suggestion['original_path']} -> {suggestion['suggested_path']}"
+                    )
+                    logger.debug(f"原因: {suggestion['reason']}")
+
+            # Apply corrections
+            cleaned_code = apply_path_corrections(
+                cleaned_code, validation_result["corrections"]
+            )
+            logger.debug("✅ 路徑修正完成")
+        else:
+            logger.debug("✅ 所有檔案路徑均有效")
 
     return _execute_code_traditional(state, cleaned_code)
 
 
 def _execute_code_traditional(state: KaggleWorkflowState, cleaned_code: str) -> Dict:
-    """使用傳統方式執行程式碼"""
-    logger.info("使用傳統模式執行程式碼")
+    """使用傳統方式執行程式碼，增強錯誤檢測和分類"""
+    import time
+
+    start_time = time.time()
 
     # 使用狀態中的工作目錄路徑
     workspace_paths = state.get("workspace_paths", {})
@@ -207,22 +1211,11 @@ def _execute_code_traditional(state: KaggleWorkflowState, cleaned_code: str) -> 
         "workspace", os.path.abspath("./kaggle_workspace")
     )
 
+    # 獲取當前執行的代理信息用於錯誤上下文
+    current_agent = state.get("last_code_generating_agent", "Unknown_Agent")
+
     # 更新可用檔案清單
-    available_files = scan_available_files(workspace_paths)  # 準備檔案資訊給代理參考
-    files_info = []
-    for folder_name, files in available_files.items():
-        if files:
-            folder_path = workspace_paths.get(folder_name, "")
-            files_info.append(f"\n[{folder_name.upper()}] 資料夾 ({folder_path}):")
-            for file in files:
-                files_info.append(f"  - {file}")
-        else:
-            folder_path = workspace_paths.get(folder_name, "")
-            files_info.append(f"\n[{folder_name.upper()}] 資料夾 ({folder_path}): 空")
-
-    files_listing = "".join(files_info) if files_info else "工作目錄為空"
-
-    # 直接執行用戶代碼，不添加額外的環境信息輸出
+    available_files = scan_available_files(workspace_paths)
     code_with_context = cleaned_code
 
     original_cwd = os.getcwd()
@@ -246,47 +1239,124 @@ def _execute_code_traditional(state: KaggleWorkflowState, cleaned_code: str) -> 
 
         stdout = stdout_capture.getvalue()
         stderr = stderr_capture.getvalue()
+        execution_time = time.time() - start_time
 
-        # 只有當 stderr 包含真正的錯誤時才視為錯誤（排除警告）
-        has_real_error = False
-        if stderr:
-            stderr_lines = stderr.split("\n")
-            for line in stderr_lines:
-                line_lower = line.lower()
-                # 檢查是否為真正的錯誤（不是警告）
-                if any(
-                    error_keyword in line_lower
-                    for error_keyword in ["error", "exception", "traceback"]
-                ):
-                    if not any(
-                        warning_keyword in line_lower
-                        for warning_keyword in ["warning", "deprecat", "future"]
-                    ):
-                        has_real_error = True
-                        break
+        # 增強的錯誤檢測和分類
+        error_info = _categorize_execution_errors(stderr, current_agent)
+        has_real_error = error_info["has_error"]
 
-        logger.info(f"STDOUT:\n{stdout}")
-        if stderr:
-            logger.info(f"STDERR:\n{stderr}")
-            if not has_real_error:
-                logger.info("注意：STDERR 包含警告訊息，但沒有真正的錯誤")
+        # 只在有錯誤時記錄詳細信息
+        if has_real_error:
+            increment_error_stats(error_info["error_type"], current_agent)
+            logger.error(f"🚨 代碼執行錯誤 - {current_agent}")
+            logger.error(f"錯誤類型: {error_info['error_type']}")
+            logger.error(f"錯誤詳情: {error_info['error_details']}")
+            logger.error(f"執行時間: {execution_time:.2f}秒")
+        elif stderr:
+            # 只有警告時使用warning級別
+            logger.warning(f"⚠️  代碼執行警告 - {current_agent}: {stderr.strip()}")
 
-        # 更新可用檔案清單
+        # 更新可用檔案清單並記錄變化
         updated_files = scan_available_files(workspace_paths)
+
+        # Log file changes for monitoring
+        old_files = state.get("available_files", {})
+        file_changes = detect_file_changes(old_files, updated_files)
+
+        if (
+            file_changes["new_files"]
+            or file_changes["deleted_files"]
+            or file_changes["modified_files"]
+        ):
+            logger.debug("📁 檔案系統變化檢測:")
+            if file_changes["new_files"]:
+                logger.debug(f"  新增檔案: {file_changes['new_files']}")
+            if file_changes["deleted_files"]:
+                logger.debug(f"  刪除檔案: {file_changes['deleted_files']}")
+            if file_changes["modified_files"]:
+                logger.debug(f"  修改檔案: {file_changes['modified_files']}")
 
         return {
             "execution_stdout": stdout,
-            "execution_stderr": stderr if has_real_error else "",
+            "execution_stderr": error_info["formatted_error"] if has_real_error else "",
             "available_files": updated_files,
+            "file_changes": file_changes,
         }
-    except Exception as e:
-        stderr = stderr_capture.getvalue()
-        error_message = f"執行時發生例外狀況: {e}\n{stderr}"
-        logger.error(f"EXECUTION ERROR: {error_message}")
+
+    except SyntaxError as e:
+        execution_time = time.time() - start_time
+        error_message = f"語法錯誤: {e.msg} (行 {e.lineno})"
+        increment_error_stats("syntax_error", current_agent)
+        logger.error(f"🚨 語法錯誤 - {current_agent}: {error_message}")
+        logger.error(f"執行時間: {execution_time:.2f}秒")
         return {
             "execution_stdout": stdout_capture.getvalue(),
             "execution_stderr": error_message,
             "available_files": available_files,
+            "file_changes": {
+                "new_files": [],
+                "deleted_files": [],
+                "modified_files": [],
+                "summary": "error occurred",
+            },
+        }
+    except ImportError as e:
+        execution_time = time.time() - start_time
+        error_message = f"導入錯誤: {str(e)}"
+        increment_error_stats("import_error", current_agent)
+        logger.error(f"🚨 導入錯誤 - {current_agent}: {error_message}")
+        logger.error(f"執行時間: {execution_time:.2f}秒")
+        return {
+            "execution_stdout": stdout_capture.getvalue(),
+            "execution_stderr": error_message,
+            "available_files": available_files,
+            "file_changes": {
+                "new_files": [],
+                "deleted_files": [],
+                "modified_files": [],
+                "summary": "error occurred",
+            },
+        }
+    except FileNotFoundError as e:
+        execution_time = time.time() - start_time
+        error_message = f"文件未找到: {str(e)}"
+        increment_error_stats("file_error", current_agent)
+        logger.error(f"🚨 文件錯誤 - {current_agent}: {error_message}")
+        logger.error(f"執行時間: {execution_time:.2f}秒")
+        return {
+            "execution_stdout": stdout_capture.getvalue(),
+            "execution_stderr": error_message,
+            "available_files": available_files,
+            "file_changes": {
+                "new_files": [],
+                "deleted_files": [],
+                "modified_files": [],
+                "summary": "error occurred",
+            },
+        }
+    except Exception as e:
+        execution_time = time.time() - start_time
+        stderr = stderr_capture.getvalue()
+        error_type = type(e).__name__
+        error_message = f"運行時錯誤 ({error_type}): {str(e)}"
+        if stderr:
+            error_message += f"\n詳細信息:\n{stderr}"
+
+        increment_error_stats("runtime_error", current_agent)
+        logger.error(f"🚨 運行時錯誤 - {current_agent}: {error_type}")
+        logger.error(f"錯誤詳情: {str(e)}")
+        logger.error(f"執行時間: {execution_time:.2f}秒")
+
+        return {
+            "execution_stdout": stdout_capture.getvalue(),
+            "execution_stderr": error_message,
+            "available_files": available_files,
+            "file_changes": {
+                "new_files": [],
+                "deleted_files": [],
+                "modified_files": [],
+                "summary": "error occurred",
+            },
         }
     finally:
         os.chdir(original_cwd)
@@ -321,8 +1391,27 @@ def save_report_file(filename: str, content: str, workspace_paths: Dict) -> str:
 def create_agent_node(system_prompt: str, agent_name: str):
     @traceable(name=agent_name)
     def agent_node(state: KaggleWorkflowState) -> Dict:
-        logger.info(f"正在呼叫代理: {agent_name}")
+        logger.debug(f"正在呼叫代理: {agent_name}")
         task_description = state.get("current_task_description", "")
+
+        # Enhanced context with file awareness
+        workspace_paths = state.get("workspace_paths", {})
+        available_files = state.get("available_files", {})
+
+        # Generate file context for the agent
+        file_context = generate_file_context_string(workspace_paths, available_files)
+
+        # Enhance task description with file context
+        enhanced_task_description = f"""
+{task_description}
+
+{file_context}
+
+IMPORTANT: Use the file paths exactly as shown above. Always check the available files before referencing them in your code.
+"""
+
+        # Create structured LLM for code-generating agents
+        structured_llm = create_structured_llm(CODE_AGENT_SCHEMA)
 
         # 為Model Architect注入目標欄位資訊
         if agent_name == "Model_Architect_Agent":
@@ -337,397 +1426,286 @@ def create_agent_node(system_prompt: str, agent_name: str):
                 "{{{{possible_targets}}}}", "{{possible_targets}}"
             )
 
-            prompt_template = ChatPromptTemplate.from_messages(
-                [("system", enhanced_prompt), ("human", "{current_task_description}")]
-            )
-            agent = prompt_template | llm
-            response = agent.invoke({"current_task_description": task_description})
-        else:
-            prompt_template = ChatPromptTemplate.from_messages(
-                [("system", system_prompt), ("human", "{current_task_description}")]
-            )
-            agent = prompt_template | llm
-            response = agent.invoke({"current_task_description": task_description})
+            try:
+                # Try structured output first
+                response = structured_llm.invoke(
+                    [
+                        SystemMessage(content=enhanced_prompt),
+                        HumanMessage(content=enhanced_task_description),
+                    ]
+                )
 
-        return {
-            "code_to_execute": response.content,
-            "last_code_generating_agent": agent_name,
-        }
+                if validate_json_response(response, agent_name):
+                    logger.debug(f"✅ {agent_name} 成功產生結構化回應")
+                    return {
+                        "code_to_execute": response.get("code_to_execute", ""),
+                        "last_code_generating_agent": agent_name,
+                    }
+                else:
+                    raise ValueError("Invalid JSON response")
+
+            except Exception as e:
+                logger.error(f"❌ {agent_name} JSON回應失敗: {e}")
+                logger.debug(f"🔄 {agent_name} 降級為傳統文本模式")
+
+                # Fallback to original approach
+                sanitized_system_prompt = _escape_braces_for_template(
+                    enhanced_prompt, keep=["current_task_description"]
+                )
+                prompt_template = ChatPromptTemplate.from_messages(
+                    [
+                        ("system", sanitized_system_prompt),
+                        ("human", "{current_task_description}"),
+                    ]
+                )
+                agent = prompt_template | llm
+                response = agent.invoke(
+                    {"current_task_description": enhanced_task_description}
+                )
+
+                return {
+                    "code_to_execute": response.content,
+                    "last_code_generating_agent": agent_name,
+                }
+        else:
+            try:
+                # Try structured output first
+                response = structured_llm.invoke(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=enhanced_task_description),
+                    ]
+                )
+
+                if validate_json_response(response, agent_name):
+                    logger.debug(f"✅ {agent_name} 成功產生結構化回應")
+                    return {
+                        "code_to_execute": response.get("code_to_execute", ""),
+                        "last_code_generating_agent": agent_name,
+                    }
+                else:
+                    raise ValueError("Invalid JSON response")
+
+            except Exception as e:
+                logger.error(f"❌ {agent_name} JSON回應失敗: {e}")
+                logger.debug(f"🔄 {agent_name} 降級為傳統文本模式")
+
+                # Fallback to original approach
+                sanitized_system_prompt = _escape_braces_for_template(
+                    system_prompt, keep=["current_task_description"]
+                )
+                prompt_template = ChatPromptTemplate.from_messages(
+                    [
+                        ("system", sanitized_system_prompt),
+                        ("human", "{current_task_description}"),
+                    ]
+                )
+                agent = prompt_template | llm
+                response = agent.invoke(
+                    {"current_task_description": enhanced_task_description}
+                )
+
+                return {
+                    "code_to_execute": response.content,
+                    "last_code_generating_agent": agent_name,
+                }
 
     return agent_node
 
 
 # 代理的 Prompt 維持不變...
-project_manager_prompt = """
-你是專案經理，一個頂尖的資料科學團隊的領導者。
-你的工作是分析 Kaggle 題目的描述，確定問題類型（例如，二元分類、迴歸）、評估指標（例如，AUC、Accuracy），並制定一個初步的高層次計畫。
-
-**重要任務**：
-1. 從使用者的問題描述中識別並提取目標變數的名稱
-2. 仔細分析問題描述，找出明確提到的目標欄位
-
-**目標欄位識別規則**：
-- 根據問題描述中明確提到的欄位名稱進行識別
-- 仔細分析用戶提供的資料集說明和問題描述
-
-請在回應中明確指出：
-TARGET_COLUMN: [推斷的目標欄位名稱]
-
-你的輸出必須是一個清晰、分步驟的計畫，並將其放入 `plan` 中。
-最後，為下一個代理（資料分析師）創建一個初始任務描述。
-
-**重要**: 在給資料分析師的指示中，請使用標準英文引號，避免中文標點符號。
-
-**新的資料分割策略**: 我們現在使用三個資料集：
-- 訓練集 (60%): 用於模型訓練
-- 驗證集 (20%): 用於超參數調整和模型選擇
-- 測試集 (20%): 用於最終模型性能評估
-
-範例輸出格式:
-TARGET_COLUMN: [根據問題描述推斷的目標欄位]
-
-初步計畫如下：
-1.  **資料探索 (EDA)**：載入三個資料集，理解每個欄位的意義、分佈和缺失情況。
-2.  **特徵工程**：根據 EDA 結果處理缺失值、編碼類別變數、並可能創造新特徵。確保三個資料集的處理一致性。
-3.  **模型訓練與調整**：使用訓練集訓練模型，在驗證集上進行超參數調整，選擇最佳配置。
-4.  **最終評估**：在測試集上評估最終模型性能，生成提交檔案。
-
-接下來的任務是：請載入位於 data 資料夾中的三個原始資料集 (data/train.csv, data/validation.csv, data/test.csv)，並進行詳細的探索性資料分析（EDA）。重點分析訓練集的資料結構，並比較三個資料集的一致性。請使用標準的英文引號和ASCII字符來編寫代碼。
-"""
 
 
 def project_manager_node(state: KaggleWorkflowState) -> Dict:
-    logger.info("正在呼叫代理: 專案經理")
-    prompt = project_manager_prompt.format(data_path=state["data_path"])
+    """Project manager agent node with robust structured response handling.
 
-    response = llm.invoke(
-        [
-            SystemMessage(content=prompt),
-            HumanMessage(content=state["problem_statement"]),
-        ]
-    )
+    Fixes:
+    - Safely handle Pydantic BaseModel (uses model_dump / dict)
+    - Handle raw string (attempt JSON extraction / fallback)
+    - Avoid calling .get on BaseModel directly
+    - Trim and sanitize target_column
+    - Provide clearer debug logs for troubleshooting
+    """
+    logger.debug("正在呼叫代理: 專案經理 (增強版)")
+    # NOTE: Avoid using .format on the prompt because it contains JSON braces which
+    # would trigger KeyError (e.g., '{"target_column"'). If data_path injection is needed
+    # explicitly add a placeholder like '{data_path}' and escape other braces. For now we
+    # just use the static prompt.
+    prompt = PROJECT_MANAGER_PROMPT  # previously used .format causing KeyError
 
-    # 提取目標欄位名稱
-    response_content = response.content
-    target_column = "target"  # 預設值
+    structured_llm = create_structured_llm(PROJECT_MANAGER_SCHEMA)
 
-    # 從回應中提取目標欄位
-    if "TARGET_COLUMN:" in response_content:
+    def _response_to_dict(resp):
+        """Normalize different response object types into a plain dict."""
         try:
-            target_line = [
-                line
-                for line in response_content.split("\n")
-                if "TARGET_COLUMN:" in line
-            ][0]
-            target_column = target_line.split("TARGET_COLUMN:")[1].strip()
-            logger.info(f"從回應中提取到目標欄位: {target_column}")
-        except Exception as e:
-            logger.warning(f"無法從回應中提取目標欄位: {e}")
-            # 如果提取失敗，使用預設值
-            target_column = "target"
-            logger.info(f"使用預設目標欄位: {target_column}")
-    else:
-        # 如果回應中沒有TARGET_COLUMN標記，使用預設值
-        target_column = "target"
-        logger.info(f"回應中無TARGET_COLUMN標記，使用預設目標欄位: {target_column}")
+            # Already dict
+            if isinstance(resp, dict):
+                return resp
+            # Pydantic v2
+            if hasattr(resp, "model_dump") and callable(getattr(resp, "model_dump")):
+                return resp.model_dump()
+            # Pydantic v1
+            if hasattr(resp, "dict") and callable(getattr(resp, "dict")):
+                return resp.dict()
+            # LangChain message with .content
+            if hasattr(resp, "content") and isinstance(resp.content, (str, dict)):
+                inner = resp.content
+                if isinstance(inner, dict):
+                    return inner
+                # Try to parse JSON from string
+                parsed = _extract_json(inner)
+                if parsed:
+                    return parsed
+                return {"raw_text": inner}
+            # Raw string
+            if isinstance(resp, str):
+                parsed = _extract_json(resp)
+                if parsed:
+                    return parsed
+                return {"raw_text": resp}
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"❌ 轉換回應為字典失敗: {e}")
+        return {}
 
-    return {
-        "current_task_description": response_content,
-        "plan": response_content,
-        "target_column": target_column,
-    }
+    def _extract_json(text: str):
+        import json
+        import re
+
+        if not text:
+            return None
+        # Try direct load
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        # Extract largest JSON object with braces
+        try:
+            match = re.search(r"\{[\s\S]*\}", text)
+            if match:
+                candidate = match.group(0)
+                # Clean common issues (newline before key, trailing commas)
+                candidate = re.sub(r'\n\s+(".*?":)', r" \1", candidate)
+                candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+                return json.loads(candidate)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"JSON抽取失敗: {e}")
+        return None
+
+    try:
+        response = structured_llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=state.get("problem_statement", "")),
+            ]
+        )
+
+        logger.debug(f"Project Manager raw response type: {type(response)}")
+        logger.debug(
+            f"Project Manager dir: {dir(response) if hasattr(response, '__dir__') else 'n/a'}"
+        )
+        if hasattr(response, "__dict__"):
+            logger.debug(f"Project Manager __dict__: {vars(response)}")
+
+        resp_dict = _response_to_dict(response)
+        logger.debug(f"Normalized response dict: {resp_dict}")
+
+        if not resp_dict:
+            raise ValueError("Empty or unparseable response from structured_llm")
+
+        # If schema fields nested under data key (rare), flatten
+        if all(
+            k in resp_dict.get("data", {})
+            for k in ["target_column", "plan", "next_task_description"]
+        ):
+            resp_dict = resp_dict["data"]
+
+        # Validate required keys
+        missing = [
+            k
+            for k in ["target_column", "plan", "next_task_description"]
+            if k not in resp_dict
+        ]
+        if missing:
+            raise KeyError(
+                f"Missing required keys in response: {missing}; raw keys: {list(resp_dict.keys())}"
+            )
+
+        target_column = resp_dict.get("target_column") or "target"
+        if isinstance(target_column, str):
+            target_column = target_column.strip().replace("\n", "").replace("\r", "")
+        else:
+            target_column = str(target_column)
+
+        plan = resp_dict.get("plan", "")
+        next_task = resp_dict.get("next_task_description", plan)
+
+        logger.debug(f"✅ 專案經理成功識別目標欄位: {target_column}")
+        logger.debug(f"問題類型: {resp_dict.get('problem_type')}")
+        logger.debug(f"評估指標: {resp_dict.get('evaluation_metric')}")
+
+        return {
+            "current_task_description": next_task,
+            "plan": plan,
+            "target_column": target_column,
+        }
+
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"❌ 專案經理結構化處理失敗: {e}")
+        logger.debug("🔄 降級為傳統文本解析模式")
+        # Fallback: simple LLM invocation and heuristic parsing
+        fallback_resp = llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=state.get("problem_statement", "")),
+            ]
+        )
+        raw_text = getattr(fallback_resp, "content", str(fallback_resp))
+
+        # Try to extract target column heuristically
+        heur_target = "target"
+        patterns = [
+            r"target_column\s*[:=]\s*['\"]([^'\"]+)['\"]",
+            r"TARGET_COLUMN:\s*(\w+)",
+        ]
+        import re
+
+        for pat in patterns:
+            m = re.search(pat, raw_text, re.IGNORECASE)
+            if m:
+                heur_target = m.group(1)
+                break
+        heur_target = heur_target.strip().replace("\n", "")
+        logger.debug(f"降級模式推斷目標欄位: {heur_target}")
+        return {
+            "current_task_description": raw_text,
+            "plan": raw_text,
+            "target_column": heur_target or "target",
+        }
 
 
-data_analyst_prompt = """
-你是資料分析師，專長是探索性資料分析 (EDA)。
-你的任務是根據收到的指示，編寫 Python 程式碼來分析資料。
-你的程式碼必須是自包含的 (self-contained)，包含所有必要的 import (pandas, matplotlib.pyplot, seaborn 等)。
+data_analysis_agent = create_agent_node(DATA_ANALYST_PROMPT, "Data_Analysis_Agent")
 
-**重要提醒**：
-- 程式執行前會顯示當前工作目錄和所有可用檔案的清單，以及各資料夾的絕對路徑
-- 請仔細查看檔案清單，確認三個原始資料集都存在於 data 資料夾中
-- **資料來源**：使用 data 資料夾中的原始資料集：
-  * data/train.csv (訓練集，用於主要分析)
-  * data/validation.csv (驗證集，用於對比分析)
-  * data/test.csv (測試集，用於對比分析)
-- **分析重點**：以訓練集為主要分析對象，驗證集和測試集用於檢查資料一致性
-- 所有資料夾已經創建完成，你不需要創建任何資料夾
-- 使用標準英文引號 (') 和雙引號 (")，避免使用中文引號
-- **重要**: 在Windows系統中，如果必須使用絕對路徑，請使用正斜杠 / 或原始字串 r"path" 或雙反斜杠 \\
-- **圖片保存**: 所有圖片必須保存在 'image' 資料夾中，不要使用 plt.show()
-- **字型設定**: 在代碼開始處添加以下字型配置以避免中文字型錯誤：
-  plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
-  plt.rcParams['axes.unicode_minus'] = False
-- ** Don't use tkinter**: 不要使用 tkinter 或其他 GUI 庫，所有輸出必須是純 Python 程式碼
-
-程式碼應該：
-1.  **字型配置**: 在導入matplotlib後立即設置字型配置：
-    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
-    plt.rcParams['axes.unicode_minus'] = False
-2.  載入並檢查所有三個原始資料集 (data/train.csv, data/validation.csv, data/test.csv)。
-3.  **主要分析對象**：以訓練集 (data/train.csv) 為主，使用 `.info()`, `.describe()`, `.shape` 顯示詳細資訊。
-4.  **資料一致性檢查**：比較三個資料集的欄位結構、資料類型是否一致。
-5.  **缺失值分析**：使用 `.isnull().sum()` 分析所有三個資料集的缺失值模式並比較差異。
-6.  **分佈分析**：對於數值型欄位，繪製訓練集的分佈圖（直方圖），保存在 'image' 資料夾中。
-7.  **類別分析**：對於類別型欄位，計算訓練集中各值的計數 (`.value_counts()`)。
-8.  **目標變數分析**：分析目標變數在訓練集和驗證集中的分佈，繪製對比圖表並保存在 'image' 資料夾中。
-9.  **輸出結果**：使用標準的 print() 函數輸出所有分析結果和關鍵信息，但不要使用任何 logging 功能。
-10. **重要**: 你的輸出**僅包含純 Python 程式碼**，不要包含任何 Markdown 標籤如 ```python 或 ```。
-11. **重要**: 使用標準ASCII引號，避免使用特殊字符。
-12. **路徑建議**: 推薦使用相對路徑如 'data/train.csv'，或者使用 os.path.join('data', 'train.csv')
-13. **圖片處理**: 使用 plt.savefig() 保存圖片到 'image' 資料夾，然後使用 plt.close() 關閉圖片，不要使用 plt.show()
-14. **重要**: 不要在代碼中導入或使用 logging 模組，避免干擾主程序的日誌系統
-"""
-data_analysis_agent = create_agent_node(data_analyst_prompt, "Data_Analysis_Agent")
-
-feature_engineer_prompt = """
-你是特徵工程師，專長是資料前處理和特徵創造。
-你會收到一份 EDA 報告和一個任務描述。
-你的任務是編寫 Python 程式碼來處理資料。程式碼必須是自包含的。
-
-**重要提醒**：
-- 程式執行前會顯示當前工作目錄和所有可用檔案的清單，以及各資料夾的絕對路徑
-- 請仔細查看檔案清單，確認三個原始資料集都存在於 data 資料夾中
-- **資料來源**：使用 data 資料夾中的原始資料集進行特徵工程：
-  * data/train.csv (訓練集原始資料)
-  * data/validation.csv (驗證集原始資料)  
-  * data/test.csv (測試集原始資料)
-- **輸出目標**：處理後的資料將保存到 after_preprocessing 資料夾
-- **一致性要求**：確保對所有三個資料集應用完全相同的處理步驟
-- 所有資料夾已經創建完成，你不需要創建任何資料夾
-- 使用標準英文引號 (') 和雙引號 (")，避免使用中文引號
-- **重要**: 在Windows系統中，如果必須使用絕對路徑，請使用正斜杠 / 或原始字串 r"path" 或雙反斜杠 \\
-- **處理過的數據保存**: 所有處理過的數據必須保存在 'after_preprocessing' 資料夾中
-- **字型設定**: 如果需要繪製圖表，在代碼開始處添加字型配置以避免中文字型錯誤：
-  plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
-  plt.rcParams['axes.unicode_minus'] = False
-- ** Don't use tkinter**: 不要使用 tkinter 或其他 GUI 庫
-
-程式碼應該：
-1.  **字型配置**: 如果需要繪製圖表，在導入matplotlib後立即設置字型配置：
-    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
-    plt.rcParams['axes.unicode_minus'] = False
-2.  **載入原始資料**：從 data 資料夾載入所有三個原始資料集 (data/train.csv, data/validation.csv, data/test.csv)。
-3.  **特徵工程處理**：根據 EDA 報告的指示處理缺失值、編碼類別變數、縮放數值變數、創造新特徵。
-4.  **一致性保證**：確保對所有三個資料集（訓練、驗證、測試）應用完全相同的處理步驟，保持資料一致性。
-5.  **保存處理後資料**：將處理好的資料保存為新的 CSV 檔案到 'after_preprocessing' 資料夾：
-    - after_preprocessing/train_processed.csv 
-    - after_preprocessing/validation_processed.csv 
-    - after_preprocessing/test_processed.csv
-6.  **處理報告**：在程式碼結尾處，使用標準的 print() 函數詳細說明你做了哪些處理，並確認檔案已保存。
-7.  **重要**: 你的輸出**僅包含純 Python 程式碼**，不要包含任何 Markdown 標籤如 ```python 或 ```。
-8.  **重要**: 使用標準ASCII引號，避免使用特殊字符。
-9.  **路徑建議**: 推薦使用相對路徑如 'data/train.csv'，或者使用 os.path.join('data', 'train.csv')
-10. **重要**: 不要在代碼中導入或使用 logging 模組，避免干擾主程序的日誌系統
-"""
 feature_engineer_agent = create_agent_node(
-    feature_engineer_prompt, "Feature_Engineer_Agent"
+    FEATURE_ENGINEER_PROMPT, "Feature_Engineer_Agent"
 )
 
-model_architect_prompt = """
-你是模型架構師，精通各種機器學習模型。
-你的任務是根據指示編寫模型訓練和預測的 Python 程式碼。程式碼必須是自包含的。
-
-**重要提醒**：
-- 程式執行前會顯示當前工作目錄和所有可用檔案的清單，以及各資料夾的絕對路徑
-- 請仔細查看檔案清單，確認三個處理過的資料集都存在於 after_preprocessing 資料夾中
-- **目標欄位**: 使用 "{target_column}" 作為目標變數，請先檢查此欄位是否存在
-- **資料來源**：使用 after_preprocessing 資料夾中的處理過資料集：
-  * after_preprocessing/train_processed.csv (用於模型訓練)
-  * after_preprocessing/validation_processed.csv (用於超參數調整)
-  * after_preprocessing/test_processed.csv (用於最終測試評估)
-- **資料用途明確**：
-  * 訓練集：訓練模型和學習模式
-  * 驗證集：調整超參數和選擇最佳模型配置
-  * 測試集：最終性能評估（不用於模型訓練或調參）
-- 所有資料夾已經創建完成，你不需要創建任何資料夾
-- 使用標準英文引號 (') 和雙引號 (")，避免使用中文引號
-- **重要**: 在Windows系統中，如果必須使用絕對路徑，請使用正斜杠 / 或原始字串 r"path" 或雙反斜杠 \\
-- **模型保存**: 所有模型必須保存在 'model' 資料夾中
-- **圖片保存**: 所有圖片必須保存在 'image' 資料夾中，不要使用 plt.show()
-- ** Don't use tkinter**: 不要使用 tkinter 或其他 GUI 庫
-
-程式碼應該按照以下步驟：
-1.  **載入處理過的資料並檢查欄位**：
-    ```python
-    # 使用 state 中指定的目標欄位名稱
-    target_col = "{target_column}"
-    print("Available columns:", train_processed.columns.tolist())
-    ```
-2.  **資料準備**：從訓練和驗證資料集中分離特徵 (X) 和目標變數 (y)，測試集暫時保留完整資料。
-3.  **超參數調整階段**：
-    - 使用訓練資料 (train_processed.csv) 訓練多個模型配置 (例如不同的 RandomForest 參數)
-    - 在驗證資料集 (validation_processed.csv) 上評估每個配置的性能
-    - 選擇在驗證集上表現最佳的超參數
-4.  **最終模型訓練**：
-    - 使用最佳超參數在訓練資料 (train_processed.csv) 上訓練最終模型
-    - 在驗證資料集 (validation_processed.csv) 上計算最終驗證分數
-    - **最重要的一步**：將驗證分數打印出來，格式必須為 `Validation Score: [分數]`
-5.  **測試評估**：
-    - 在測試資料集 (test_processed.csv) 上評估最終模型性能
-    - 打印測試分數，格式為 `Test Score: [分數]`
-6.  **生成預測和輸出**：
-    - 對測試集進行預測，保存為 `submission.csv` 檔案 (包含預測結果)
-    - 將訓練完成的模型保存為 pickle 檔案到 'model' 資料夾 (model/model.pkl)
-    - 生成並保存 confusion matrix 圖片到 'image' 資料夾 (image/confusion_matrix.png) - 使用測試集結果
-    - 如果模型支援 feature importance，生成並保存 top 10 特徵重要性圖片到 'image' 資料夾 (image/feature_importance.png)
-    - **SHAP 分析**: 使用 SHAP 庫生成模型可解釋性分析：
-        * 生成並保存 SHAP summary plot 到 'image' 資料夾 (image/shap_summary.png) - 顯示 top 10 特徵的全局重要性
-        * 生成並保存 SHAP waterfall plot 到 'image' 資料夾 (image/shap_waterfall.png) - 展示單個預測的特徵貢獻
-        * 生成並保存 SHAP feature importance 圖片到 'image' 資料夾 (image/shap_feature_importance.png)
-        * 計算並打印 SHAP values 的統計摘要和關鍵洞察
-    - 打印提交檔案路徑，格式為 `Submission file saved to: [路徑]`
-    - 使用標準的 print() 函數報告所有檔案的保存狀態和模型性能摘要
-7.  **重要**: 你的輸出**僅包含純 Python 程式碼**，不要包含任何 Markdown 標籤如 ```python 或 ```。
-8.  **重要**: 使用標準ASCII引號，避免使用特殊字符。
-9.  **路徑建議**: 推薦使用相對路徑如 'after_preprocessing/train_processed.csv'，或者使用 os.path.join('after_preprocessing', 'train_processed.csv')
-10. **圖片處理**: 使用 plt.savefig() 保存圖片到 'image' 資料夾，然後使用 plt.close() 關閉圖片，不要使用 plt.show()
-11. **重要**: 不要在代碼中導入或使用 logging 模組，避免干擾主程序的日誌系統
-12. ** Don't use tkinter**: 不要使用 tkinter 或其他 GUI 庫，所有輸出必須是純 Python 程式碼
-13. **SHAP 實現範例**: 使用以下模式進行 SHAP 分析：
-    ```python
-    import shap
-    
-    # 初始化SHAP explainer (根據模型類型選擇)
-    if hasattr(best_model, 'predict_proba'):
-        explainer = shap.Explainer(best_model, X_train_sample)  # 使用訓練集樣本
-    else:
-        explainer = shap.Explainer(best_model.predict, X_train_sample)
-    
-    # 計算SHAP values (使用測試集樣本)
-    shap_values = explainer(X_test_sample)
-    
-    # 生成SHAP summary plot
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values, X_test_sample, show=False)
-    plt.savefig('image/shap_summary.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 生成SHAP feature importance
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test_sample, plot_type="bar", show=False)
-    plt.savefig('image/shap_feature_importance.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 生成SHAP waterfall plot (單個樣本解釋)
-    plt.figure(figsize=(10, 6))
-    shap.waterfall_plot(shap_values[0], show=False)
-    plt.savefig('image/shap_waterfall.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    ```
-"""
 model_architect_agent = create_agent_node(
-    model_architect_prompt, "Model_Architect_Agent"
+    MODEL_ARCHITECT_PROMPT, "Model_Architect_Agent"
 )
 
 # 報告撰寫代理
-report_generator_prompt = """
-You are a senior data scientist tasked with writing a comprehensive professional Markdown analysis report with advanced SHAP interpretability and automated insights generation.
-
-The report must include these sections:
-1. **Executive Summary**: A summary of key findings and model performance.
-2. **Data Overview**: Dataset characteristics and preprocessing steps.
-3. **Model Performance**: Detailed analysis of metrics with confusion matrix.
-4. **Feature Importance Analysis**: Traditional feature importance with interpretation.
-5. **SHAP Interpretability Analysis**: 
-   - Global feature importance from SHAP values
-   - Individual prediction explanations using waterfall plots
-   - Key insights from SHAP analysis
-   - Comparison between traditional and SHAP-based feature importance
-6. **Automated Insights & Recommendations**: 
-   - Data-driven insights extracted from model behavior
-   - Business actionable recommendations
-   - Model limitations and improvement suggestions
-   - Risk factors and considerations
-
-**Enhanced Analysis Requirements:**
-- Generate automated insights by analyzing feature importance patterns
-- Identify potential biases or data quality issues from SHAP values
-- Provide business interpretation of top contributing features
-- Compare model predictions with domain knowledge expectations
-- Suggest concrete next steps for model improvement
-
-**Important Instructions:**
-- You must analyze the current state to extract relevant information for the report
-- Look for available files in the 'image' folder to find charts to embed
-- Prioritize SHAP visualizations: shap_summary.png, shap_waterfall.png, shap_feature_importance.png
-- Extract validation and test scores from the execution history
-- Use the iteration history to understand the workflow progression
-- Write the report in professional Markdown format
-- Use standard English quotes and ASCII characters
-- Embed images using the format: `![Description](image/filename.png)`
-
-**Available Information Sources:**
-- execution_stdout: Contains model training results, SHAP analysis, and automated insights
-- iteration_history: Contains workflow progression and key milestones
-- available_files: Lists all available files including generated charts
-- validation_score and test_score: Model performance metrics
-- workspace_paths: Contains paths to different folders
-
-After composing the report, you **MUST** call the save_report_file function by returning Python code that calls:
-```python
-# Your analysis code here to extract information from state
-report_content = '''
-# Comprehensive Data Science Analysis Report
-
-## Executive Summary
-[Key findings, model performance summary, and main insights]
-
-## Data Overview
-[Dataset characteristics, preprocessing steps, and data quality observations]
-
-## Model Performance
-[Detailed metrics analysis with context and interpretation]
-![Confusion Matrix](image/confusion_matrix.png)
-
-## Feature Importance Analysis
-[Traditional feature importance analysis and interpretation]
-![Traditional Feature Importance](image/feature_importance.png)
-
-## SHAP Interpretability Analysis
-
-### Global Feature Importance
-[Analysis of SHAP summary plot showing global feature contributions]
-![SHAP Summary Plot](image/shap_summary.png)
-
-### SHAP Feature Importance
-[Detailed SHAP-based feature importance analysis]
-![SHAP Feature Importance](image/shap_feature_importance.png)
-
-### Individual Prediction Explanation
-[Analysis of waterfall plot showing how features contribute to specific predictions]
-![SHAP Waterfall Plot](image/shap_waterfall.png)
-
-### Key SHAP Insights
-[Important patterns and insights discovered from SHAP analysis]
-
-## Automated Insights & Recommendations
-
-### Model Behavior Analysis
-[Data-driven insights about model performance and behavior patterns]
-
-### Business Recommendations
-[Actionable business recommendations based on analysis]
-
-### Model Limitations & Improvement Suggestions
-[Identified limitations and concrete improvement recommendations]
-
-### Risk Factors & Considerations
-[Potential risks and important considerations for deployment]
-'''
-
-# Save the report
-result = save_report_file("analysis_report.md", report_content, workspace_paths)
-print(result)
-```
-
-Your final output must be Python code that generates and saves the report.
-"""
 
 
 def report_generator_node(state: KaggleWorkflowState) -> Dict:
     """專門處理報告生成的節點，具備增強的SHAP分析和自動化洞察提取"""
-    logger.info("正在呼叫代理: 報告撰寫代理")
+    logger.debug("正在呼叫代理: 報告撰寫代理")
+
+    # Create structured LLm for Report Generator
+    structured_llm = create_structured_llm(REPORT_GENERATOR_SCHEMA)
+
+    # Enhanced context with file awareness
+    workspace_paths = state.get("workspace_paths", {})
+    available_files = state.get("available_files", {})
 
     # 準備上下文資訊
     context_info = []
@@ -807,8 +1785,8 @@ def report_generator_node(state: KaggleWorkflowState) -> Dict:
 
     context_str = "\n".join(context_info)
 
-    # 準備工作區路徑資訊供代理使用
-    workspace_paths = state.get("workspace_paths", {})
+    # Generate file context for the report generator
+    file_context = generate_file_context_string(workspace_paths, available_files)
 
     # 構建完整的任務描述
     task_description = f"""
@@ -817,8 +1795,8 @@ Based on the analysis workflow results, generate a comprehensive data science re
 Current State Information:
 {context_str}
 
-Workspace Paths Available:
-{workspace_paths}
+Current File System State:
+{file_context}
 
 Special Instructions for Enhanced Reporting:
 1. Prioritize SHAP visualizations in the report structure
@@ -827,84 +1805,58 @@ Special Instructions for Enhanced Reporting:
 4. Generate business-actionable recommendations based on SHAP patterns
 5. Address model deployment readiness and risk assessment
 
-Please generate Python code that:
-1. Analyzes the provided state information with focus on SHAP and automated insights
-2. Creates a professional Markdown report following the enhanced template structure
-3. Intelligently embeds available charts with proper context and analysis
-4. Extracts key metrics and insights for business interpretation
-5. Calls save_report_file() to save the comprehensive report as 'analysis_report.md'
+Please respond in JSON format with:
+- code_to_execute: Python code to generate the report
+- report_title: Title of the analysis report
+- report_summary: Executive summary of findings
+- key_findings: List of main discoveries
+- recommendations: List of actionable recommendations
+- charts_analyzed: List of charts that will be analyzed in the report
 """
 
-    prompt_template = ChatPromptTemplate.from_messages(
-        [("system", report_generator_prompt), ("human", "{task_description}")]
-    )
-    agent = prompt_template | llm
-    response = agent.invoke({"task_description": task_description})
+    try:
+        # Try structured output first
+        response = structured_llm.invoke(
+            [
+                SystemMessage(content=REPORT_GENERATOR_PROMPT),
+                HumanMessage(content=task_description),
+            ]
+        )
 
-    return {
-        "code_to_execute": response.content,
-        "last_code_generating_agent": "Report_Generator_Agent",
-    }
+        if validate_json_response(response, "ReportGenerator"):
+            logger.debug("✅ 報告生成代理成功產生結構化回應")
+            return {
+                "code_to_execute": response.get("code_to_execute", ""),
+                "last_code_generating_agent": "Report_Generator_Agent",
+            }
+        else:
+            raise ValueError("Invalid JSON response")
+
+    except Exception as e:
+        logger.error(f"❌ 報告生成代理JSON回應失敗: {e}")
+        logger.debug("🔄 報告生成代理降級為傳統文本模式")
+
+        # Fallback to original approach
+        sanitized_report_prompt = _escape_braces_for_template(
+            REPORT_GENERATOR_PROMPT, keep=["task_description"]
+        )
+        prompt_template = ChatPromptTemplate.from_messages(
+            [("system", sanitized_report_prompt), ("human", "{task_description}")]
+        )
+        agent = prompt_template | llm
+        response = agent.invoke({"task_description": task_description})
+
+        return {
+            "code_to_execute": response.content,
+            "last_code_generating_agent": "Report_Generator_Agent",
+        }
 
 
 # **V2 更新**: 增強了策略師的 Prompt，使其能夠處理來自 Triage 節點的升級問題。
-strategist_prompt = """
-你是首席策略師，負責領導整個 AI 資料科學團隊。
-你的工作是分析上一步驟的執行結果，並決定團隊的下一步行動。
-你會收到完整的上下文，包括計畫、程式碼、標準輸出(stdout)和標準錯誤(stderr)。
-
-**新的工作流程**: 我們現在使用三個資料集：訓練集(60%)、驗證集(20%)、測試集(20%)。
-驗證集用於超參數調整，測試集用於最終性能評估。
-
-**重要: 分數解析任務**：
-請仔細檢查 `execution_stdout` 中是否包含以下格式的分數資訊：
-- "Validation Score: [數值]" - 提取驗證分數
-- "Test Score: [數值]" - 提取測試分數  
-- "Submission file saved to: [路徑]" 或包含 "submission.csv" 的檔案保存訊息 - 提取提交檔案路徑
-
-你的分析和決策流程如下：
-
-1.  **處理連續錯誤 (最高優先級)**：
-    * 如果當前任務描述中包含 "連續多次無法修正其程式碼錯誤"，這代表一個代理陷入了困境。
-    * 你的首要任務是打破循環。**不要再給出與之前相似的指令**。
-    * **分析根本原因**：錯誤是來自於誤解了指令，還是程式庫使用不當？
-    * **改變策略**：你可以：
-        a. 提供一個**更詳細、更具體的程式碼範例**來引導它。
-        b. **簡化任務**，讓它先完成一個更小的目標。
-        c. **完全改變方法**，例如，如果特徵工程一直出錯，也許是 EDA 的結論有問題，可以考慮重新進行 EDA。
-    * 你的決策 `next_step` 應該是將這個新策略指派給合適的代理。
-
-2.  **評估執行結果 (如果沒有錯誤)**：
-    * **如果上一步是 `Data_Analysis_Agent`**：總結 EDA 報告，為 `Feature_Engineer_Agent` 制定計畫。確保處理所有三個資料集。
-    * **如果上一步是 `Feature_Engineer_Agent`**：確認所有三個處理過的資料集已保存，為 `Model_Architect_Agent` 制定計畫。
-    * **如果上一步是 `Model_Architect_Agent`**：
-        - 解析 `Validation Score` 和 `Test Score`
-        - 與歷史分數比較（如果有的話）
-        - 評估模型是否已達到合理性能
-        - 決定是繼續優化模型、返回特徵工程，還是結束流程
-
-3.  **決策邏輯**：
-    * 如果測試分數已達到合理水準（例如 > 0.75），考慮生成最終報告
-    * 如果驗證和測試分數差距很大，可能有過擬合問題，需要調整模型  
-    * 如果分數太低，可能需要回到特徵工程階段
-    * 如果模型訓練完成且分數令人滿意，可以調用 "Report_Generator_Agent" 生成最終分析報告
-
-你的輸出**必須**是一個 JSON 物件，包含以下鍵：
-- `next_step`: 下一個要呼叫的代理名稱 (例如, "Feature_Engineer_Agent", "Model_Architect_Agent", "Report_Generator_Agent", 或 "END")。
-- `feedback`: 給下一個代理的詳細任務描述或修正指令。
-- `validation_score`: 從執行輸出解析的驗證分數（如果沒有找到則為null）
-- `test_score`: 從執行輸出解析的測試分數（如果沒有找到則為null）
-- `submission_file_path`: 從執行輸出解析的提交檔案路徑（如果沒有找到則為空字串）
-- `performance_analysis`: 對模型性能的分析評估
-- `should_continue`: 基於性能分析判斷是否應該繼續優化
-
-**當前狀態回顧:**
-{context_str}
-"""
 
 
 def chief_strategist_node(state: KaggleWorkflowState) -> Dict:
-    logger.info("正在呼叫代理: 首席策略師")
+    logger.debug("正在呼叫代理: 首席策略師")
     context_list = []
     for key, value in state.items():
         if key not in ["strategist_decision"] and value:
@@ -915,61 +1867,89 @@ def chief_strategist_node(state: KaggleWorkflowState) -> Dict:
             elif isinstance(value, (float, int)):
                 context_list.append(f"- {key}: {value}")
     context_str = "\n".join(context_list)
-    prompt = strategist_prompt.format(context_str=context_str)
-    logger.info(f"策略師的strategist_prompt: {context_str}")
-    json_llm = llm.with_structured_output(
-        schema={
-            "title": "StrategistDecision",
+    prompt = STRATEGIST_PROMPT.format(context_str=context_str)
+    logger.debug(f"策略師的strategist_prompt: {context_str}")
+    # Use the enhanced strategist schema with better validation
+    json_llm = create_structured_llm(ENHANCED_STRATEGIST_SCHEMA)
+
+    try:
+        response = json_llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(
+                    content="請根據以上上下文，做出你的下一步決策。特別注意解析執行輸出中的 'Validation Score:', 'Test Score:' 和 'Submission file saved to:' 資訊。"
+                ),
+            ]
+        )
+
+        if not validate_json_response(response, "StrategistDecision"):
+            raise ValueError("Invalid JSON response structure")
+
+        logger.debug(f"✅ 策略師成功產生結構化決策: {response}")
+
+    except Exception as e:
+        logger.error(f"❌ 策略師JSON回應失敗: {e}")
+        logger.debug("🔄 策略師降級為基礎結構化輸出模式")
+
+        # Fallback to basic structured output
+        fallback_schema = {
+            "title": "BasicStrategistDecision",
             "type": "object",
             "properties": {
                 "next_step": {"title": "Next Step", "type": "string"},
                 "feedback": {"title": "Feedback", "type": "string"},
                 "validation_score": {
                     "title": "Validation Score",
-                    "type": "number",
-                    "description": "驗證分數，從執行輸出中解析出來，如果沒有找到則為null",
+                    "type": ["number", "null"],
+                    "description": "驗證分數",
                 },
                 "test_score": {
                     "title": "Test Score",
-                    "type": "number",
-                    "description": "測試分數，從執行輸出中解析出來，如果沒有找到則為null",
+                    "type": ["number", "null"],
+                    "description": "測試分數",
                 },
                 "submission_file_path": {
                     "title": "Submission File Path",
                     "type": "string",
-                    "description": "提交檔案路徑，從執行輸出中解析出來，如果沒有找到則為空字串",
+                    "description": "提交檔案路徑",
                 },
                 "performance_analysis": {
                     "title": "Performance Analysis",
                     "type": "string",
-                    "description": "對模型性能的分析，包括驗證分數和測試分數的評估、是否過擬合、是否需要優化等",
+                    "description": "性能分析",
                 },
                 "should_continue": {
                     "title": "Should Continue",
                     "type": "boolean",
-                    "description": "基於性能分析，判斷是否應該繼續優化模型還是結束流程",
+                    "description": "是否繼續",
                 },
             },
             "required": ["next_step", "feedback"],
         }
-    )
-    response = json_llm.invoke(
-        [
-            SystemMessage(content=prompt),
-            HumanMessage(
-                content="請根據以上上下文，做出你的下一步決策。特別注意解析執行輸出中的 'Validation Score:', 'Test Score:' 和 'Submission file saved to:' 資訊。"
-            ),
-        ]
-    )
-    logger.info(f"策略師決策: {response}")
+
+        fallback_llm = json_llm_base.with_structured_output(fallback_schema)
+        response = fallback_llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(
+                    content="請根據以上上下文，做出你的下一步決策。特別注意解析執行輸出中的 'Validation Score:', 'Test Score:' 和 'Submission file saved to:' 資訊。"
+                ),
+            ]
+        )
+        logger.debug(f"🔄 策略師降級決策: {response}")
+
+    # Validate and sanitize response to prevent routing errors
+    response = validate_and_sanitize_strategist_response(response)
+    logger.debug(f"✅ 策略師回應已驗證和清理: {response}")
+
     new_history = state.get("iteration_history", [])
 
-    # 使用 LLM 解析的結果
+    # 使用驗證後的結果
     validation_score = response.get("validation_score")
     test_score = response.get("test_score")
     submission_file_path = response.get("submission_file_path")
     performance_analysis = response.get("performance_analysis", "")
-    should_continue = response.get("should_continue", True)
+    # should_continue 目前未使用，可在未來擴展中實現自動化流程控制
 
     # 更新歷史記錄和返回值
     result = {
@@ -1011,7 +1991,7 @@ def triage_node(state: KaggleWorkflowState) -> Dict:
     分析執行結果，決定下一步是修正、評估還是升級問題。
     """
     if state.get("execution_stderr"):
-        logger.info("偵測到程式碼錯誤，進行分流")
+        logger.debug("偵測到程式碼錯誤，進行分流")
         error_count = state.get("error_count", 0) + 1
 
         # 如果連續錯誤達到 2 次，將問題升級給策略師
@@ -1030,7 +2010,7 @@ def triage_node(state: KaggleWorkflowState) -> Dict:
             }
         # 如果錯誤次數尚在容許範圍，返回原代理修正
         else:
-            logger.info(f"第 {error_count} 次錯誤，返回修正")
+            logger.debug(f"第 {error_count} 次錯誤，返回修正")
             feedback = (
                 f"你的上一段程式碼執行失敗，請修正它。\n"
                 f"這是第 {error_count} 次嘗試。\n"
@@ -1042,7 +2022,7 @@ def triage_node(state: KaggleWorkflowState) -> Dict:
                 "next_node_after_triage": state["last_code_generating_agent"],
             }
     else:
-        logger.info("程式碼執行成功，交由策略師評估")
+        logger.debug("程式碼執行成功，交由策略師評估")
         return {
             "error_count": 0,  # 成功後重置錯誤計數器
             "next_node_after_triage": "Chief_Strategist_Agent",
@@ -1052,15 +2032,105 @@ def triage_node(state: KaggleWorkflowState) -> Dict:
 def router_after_triage(state: KaggleWorkflowState):
     """根據分流節點的決定，導向到下一個節點。"""
     destination = state.get("next_node_after_triage")
-    logger.info(f"分流結果: 前往 {destination}")
+    logger.debug(f"分流結果: 前往 {destination}")
     return destination
 
 
 def router_after_strategy(state: KaggleWorkflowState):
-    """根據首席策略師的決策，決定下一個節點。"""
-    next_step = state.get("strategist_decision", {}).get("next_step")
-    logger.info(f"策略師決定下一步: {next_step}")
-    return END if not next_step or next_step == "END" else next_step
+    """根據首席策略師的決策，決定下一個節點。
+    增強版: 強化錯誤處理和驗證，完全防止 KeyError 和路由失敗。
+    推斷邏輯:
+      1. 若已有處理後資料 (after_preprocessing/*.csv) -> 進入建模階段 Model_Architect_Agent
+      2. 若已有驗證與測試分數 (且 >0) -> 進入報告生成 Report_Generator_Agent
+      3. 否則 (僅完成 EDA) -> 進入特徵工程 Feature_Engineer_Agent
+    """
+    allowed = {
+        "Data_Analysis_Agent",
+        "Feature_Engineer_Agent",
+        "Model_Architect_Agent",
+        "Report_Generator_Agent",
+        "END",
+    }
+
+    # 預設安全的fallback
+    safe_fallback = "Feature_Engineer_Agent"
+
+    try:
+        # 獲取策略師決策，確保安全存取
+        strategist_decision = state.get("strategist_decision")
+        if not strategist_decision or not isinstance(strategist_decision, dict):
+            logger.warning(
+                f"⚠️  Missing or invalid strategist_decision, using fallback: {safe_fallback}"
+            )
+            return safe_fallback
+
+        next_step = strategist_decision.get("next_step")
+
+        # 清理和驗證 next_step 值
+        if isinstance(next_step, str):
+            next_step = next_step.strip()
+
+        # 處理常見的無效值
+        invalid_values = ["", " ", ":", ": ", "None", "null", None]
+        if next_step in invalid_values:
+            logger.warning(
+                f"⚠️  Invalid next_step value '{next_step}', inferring from workflow state"
+            )
+            next_step = None
+
+        # 驗證是否為允許的值
+        if next_step and next_step not in allowed:
+            logger.warning(
+                f"⚠️  Unrecognized next_step '{next_step}', inferring from workflow state"
+            )
+            next_step = None
+
+        # 如果需要推斷下一步
+        if not next_step:
+            try:
+                available_files = state.get("available_files", {}) or {}
+                after_pre_files = available_files.get("after_preprocessing", []) or []
+                has_processed = any(
+                    f.endswith("_processed.csv") for f in after_pre_files
+                )
+                val_score = state.get("validation_score", 0) or 0
+                test_score = state.get("test_score", 0) or 0
+
+                # 智能推斷下一步
+                if (val_score and val_score > 0) and (test_score and test_score > 0):
+                    next_step = "Report_Generator_Agent"
+                    logger.info(f"🤖 Inferred next step: {next_step} (has scores)")
+                elif has_processed:
+                    next_step = "Model_Architect_Agent"
+                    logger.info(
+                        f"🤖 Inferred next step: {next_step} (has processed data)"
+                    )
+                else:
+                    next_step = "Feature_Engineer_Agent"
+                    logger.info(f"🤖 Inferred next step: {next_step} (default)")
+
+                # 更新狀態以記錄推斷結果
+                strategist_decision["next_step"] = next_step
+                state["strategist_decision"] = strategist_decision
+
+            except Exception as e:
+                logger.error(f"❌ Error during next_step inference: {e}")
+                next_step = safe_fallback
+
+        # 最終驗證 - 確保返回值絕對安全
+        if next_step not in allowed:
+            logger.error(
+                f"❌ Final validation failed for next_step '{next_step}', using safe fallback: {safe_fallback}"
+            )
+            next_step = safe_fallback
+
+        logger.debug(f"✅ Router decision: {next_step}")
+        return END if next_step == "END" else next_step
+
+    except Exception as e:
+        logger.error(f"❌ Critical error in router_after_strategy: {e}")
+        logger.warning(f"🚨 Using emergency fallback: {safe_fallback}")
+        return safe_fallback
 
 
 # --- 5. 組裝 LangGraph 流程圖 (Assemble the Graph) ---
@@ -1123,8 +2193,13 @@ app = workflow.compile()
 
 
 def setup_titanic_dataset():
-    logger.info("正在準備範例資料集 (鐵達尼號)")
+    logger.debug("正在準備範例資料集 (鐵達尼號)")
     data_dir = os.path.abspath("./kaggle_workspace/data")
+
+    print(f"Deleting existing directory: {data_dir}")
+    if os.path.exists(os.path.abspath("./kaggle_workspace")):
+        shutil.rmtree(os.path.abspath("./kaggle_workspace"))
+
     os.makedirs(data_dir, exist_ok=True)
     train_url = (
         "https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv"
@@ -1160,7 +2235,7 @@ def setup_titanic_dataset():
 
 
 def setup_dataset(file_path: str, base_path: str):
-    logger.info("正在準備特定資料集")
+    logger.debug("正在準備特定資料集")
     data_dir = os.path.abspath(base_path)
     if os.path.exists(data_dir):
         print(f"Deleting existing directory: {data_dir}")
@@ -1209,7 +2284,7 @@ if __name__ == "__main__":
 
     if USE_TANICS_DATASET:
         data_directory = setup_titanic_dataset()
-        problem = "你的任務是分析鐵達尼號資料集，預測哪些乘客能夠生還。這是一個二元分類問題，請建立一個模型並產出分析報告。"
+        problem = "你好，你的任務是分析鐵達尼號資料集，預測哪些乘客能夠生還。這是一個二元分類問題，請建立一個模型並產出分析報告。target_column is 'Survived'。Don't use one-hot encoding."
         workspace_paths = setup_workspace_structure()
 
     # 掃描初始可用檔案
@@ -1245,19 +2320,28 @@ if __name__ == "__main__":
     # 增加 recursion_limit 以應對可能的重試
     try:
         for s in app.stream(initial_state, {"recursion_limit": 60}):
-            logger.info("---")
+            logger.debug("---")
             node_name = list(s.keys())[0]
-            logger.info(f"節點: {node_name}")
-            logger.info(f"{s[node_name]}")
+            logger.debug(f"節點: {node_name}")
+            logger.debug(f"{s[node_name]}")
             final_state = s[node_name]
     except Exception as e:
+        import traceback
+
+        print(traceback.format_exc())
         logger.error(f"工作流程執行失敗: {e}")
         logger.info("===Reach recursion_limit 75===")
 
+    # 記錄最終結果和錯誤統計
+    log_error_stats()
     logger.info("=== 工作流程執行完畢 ===")
-    logger.info(f"最終驗證分數: {final_state.get('validation_score')}")
-    logger.info(f"最終測試分數: {final_state.get('test_score')}")
-    logger.info(f"提交檔案路徑: {final_state.get('submission_file_path')}")
-    logger.info("迭代歷史:")
-    for item in final_state.get("iteration_history", []):
-        logger.info(f"- {item}")
+
+    if final_state is not None:
+        logger.info(f"最終驗證分數: {final_state.get('validation_score')}")
+        logger.info(f"最終測試分數: {final_state.get('test_score')}")
+        logger.info(f"提交檔案路徑: {final_state.get('submission_file_path')}")
+        logger.info("迭代歷史:")
+        for item in final_state.get("iteration_history", []):
+            logger.info(f"- {item}")
+    else:
+        logger.warning("工作流程執行未能完成，沒有最終狀態資訊")

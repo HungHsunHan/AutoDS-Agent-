@@ -8,7 +8,10 @@
       "Bash(git rm:*)",
       "Bash(rm:*)",
       "Bash(del kaggle_agent.log)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(grep:*)"
     ],
     "deny": []
   }
